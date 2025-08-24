@@ -1,5 +1,5 @@
 ;; =====================================================
-;; CHAINLEGAL: SMART CONTRACT LEGAL FRAMEWORK
+;; LEGALCHAIN: SMART CONTRACT LEGAL FRAMEWORK
 ;; Core Legal Framework & Contract Management
 ;; =====================================================
 
