@@ -566,4 +566,364 @@ describe("LegalChain - Contract Management and Legal Framework", () => {
   });
 });
 
+describe("LegalChain - Dispute Resolution and Legal Enforcement", () => {
+  const wallet3 = accounts.get("wallet_3")!;
+  
+  it("should register and verify arbitrators", () => {
+    // Register an arbitrator
+    const { result: registerResult } = simnet.callPublicFn(
+      "legal_chain",
+      "register-arbitrator",
+      [
+        Cl.stringAscii("US-NY"),
+        Cl.stringAscii("commercial"),
+        Cl.stringAscii("arbitrator123cert456hash")
+      ],
+      wallet3
+    );
+    expect(registerResult).toBeOk(Cl.bool(true));
+
+    // Verify arbitrator registration (only contract owner can activate)
+    const { result: activateResult } = simnet.callPublicFn(
+      "legal_chain",
+      "activate-arbitrator",
+      [Cl.principal(wallet3)],
+      deployer
+    );
+    expect(activateResult).toBeOk(Cl.bool(true));
+
+    // Try to activate as non-owner (should fail)
+    const { result: unauthorizedActivate } = simnet.callPublicFn(
+      "legal_chain",
+      "activate-arbitrator",
+      [Cl.principal(wallet3)],
+      wallet1
+    );
+    expect(unauthorizedActivate).toBeErr(Cl.uint(401)); // ERR_UNAUTHORIZED
+  });
+
+  it("should reject arbitrator registration with invalid jurisdiction", () => {
+    const { result } = simnet.callPublicFn(
+      "legal_chain",
+      "register-arbitrator",
+      [
+        Cl.stringAscii("INVALID"),
+        Cl.stringAscii("general"),
+        Cl.stringAscii("cert123")
+      ],
+      wallet2
+    );
+    expect(result).toBeErr(Cl.uint(403)); // ERR_INVALID_JURISDICTION
+  });
+
+  it("should handle complete dispute filing and resolution workflow", () => {
+    // First set up: create template, contract, and get it signed
+    simnet.callPublicFn("legal_chain", "create-contract-template",
+      [Cl.stringAscii("Dispute Test Contract"), Cl.stringAscii("service"), Cl.stringAscii("UK-ENG"),
+       Cl.stringAscii("dispute123"), Cl.stringAscii("standard")], wallet1);
+    
+    simnet.callPublicFn("legal_chain", "create-legal-contract",
+      [Cl.uint(1), Cl.list([Cl.principal(wallet1), Cl.principal(wallet2)]), 
+       Cl.stringAscii("UK-ENG"), Cl.stringAscii("service"), Cl.uint(simnet.blockHeight + 500),
+       Cl.stringAscii("disputeterms123"), Cl.stringAscii("uri"), Cl.uint(25000), Cl.uint(2)], wallet1);
+    
+    // Sign the contract to make it active
+    simnet.callPublicFn("legal_chain", "sign-contract",
+      [Cl.uint(1), Cl.stringAscii("sig1"), Cl.none()], wallet1);
+    simnet.callPublicFn("legal_chain", "sign-contract",
+      [Cl.uint(1), Cl.stringAscii("sig2"), Cl.none()], wallet2);
+
+    // Register and activate an arbitrator
+    simnet.callPublicFn("legal_chain", "register-arbitrator",
+      [Cl.stringAscii("UK-ENG"), Cl.stringAscii("service"), Cl.stringAscii("cert789")], wallet3);
+    simnet.callPublicFn("legal_chain", "activate-arbitrator", [Cl.principal(wallet3)], deployer);
+
+    // File a dispute
+    const { result: disputeResult } = simnet.callPublicFn(
+      "legal_chain",
+      "file-dispute",
+      [
+        Cl.uint(1), // contract-id
+        Cl.principal(wallet2), // defendant
+        Cl.stringAscii("breach-of-contract"),
+        Cl.stringAscii("evidence123hash456")
+      ],
+      wallet1
+    );
+    expect(disputeResult).toBeOk(Cl.uint(1));
+
+    // Verify dispute was created
+    const { result: disputeData } = simnet.callReadOnlyFn(
+      "legal_chain",
+      "get-dispute",
+      [Cl.uint(1)],
+      deployer
+    );
+    
+    // Verify dispute was created successfully (dispute exists)
+    expect(disputeData).not.toBeNone();
+    
+    // Extract the dispute data for validation
+    const dispute = disputeData as any;
+    expect(dispute.value.data["contract-id"]).toStrictEqual(Cl.uint(1));
+    expect(dispute.value.data["plaintiff"]).toStrictEqual(Cl.principal(wallet1));
+    expect(dispute.value.data["defendant"]).toStrictEqual(Cl.principal(wallet2));
+    expect(dispute.value.data["dispute-type"]).toStrictEqual(Cl.stringAscii("breach-of-contract"));
+    expect(dispute.value.data["status"]).toStrictEqual(Cl.stringAscii("filed"));
+    expect(dispute.value.data["evidence-hash"]).toStrictEqual(Cl.stringAscii("evidence123hash456"));
+
+    // Assign arbitrator
+    const { result: assignResult } = simnet.callPublicFn(
+      "legal_chain",
+      "assign-arbitrator",
+      [Cl.uint(1), Cl.principal(wallet3)],
+      wallet1 // Plaintiff can assign
+    );
+    expect(assignResult).toBeOk(Cl.bool(true));
+
+    // Resolve dispute
+    const { result: resolveResult } = simnet.callPublicFn(
+      "legal_chain",
+      "resolve-dispute",
+      [
+        Cl.uint(1),
+        Cl.stringAscii("Ruled in favor of plaintiff due to clear breach"),
+        Cl.principal(wallet1) // winning party
+      ],
+      wallet3 // Arbitrator resolves
+    );
+    expect(resolveResult).toBeOk(Cl.bool(true));
+
+    // Verify final dispute status
+    const { result: finalDisputeData } = simnet.callReadOnlyFn(
+      "legal_chain",
+      "get-dispute",
+      [Cl.uint(1)],
+      deployer
+    );
+    
+    // Check final dispute state
+    expect(finalDisputeData).not.toBeNone();
+    const finalDispute = finalDisputeData as any;
+    expect(finalDispute.value.data["status"]).toStrictEqual(Cl.stringAscii("resolved"));
+    expect(finalDispute.value.data["arbitrator"]).toStrictEqual(Cl.some(Cl.principal(wallet3)));
+    expect(finalDispute.value.data["resolution"]).toStrictEqual(Cl.some(Cl.stringAscii("Ruled in favor of plaintiff due to clear breach")));
+    // Just check that resolution date is not none
+    expect(finalDispute.value.data["resolution-date"].type).not.toBe("none");
+  });
+
+  it("should reject invalid dispute operations", () => {
+    // Set up contract for testing
+    simnet.callPublicFn("legal_chain", "create-contract-template",
+      [Cl.stringAscii("Invalid Dispute Test"), Cl.stringAscii("test"), Cl.stringAscii("US-NY"),
+       Cl.stringAscii("invaliddispute123"), Cl.stringAscii("basic")], wallet1);
+    
+    simnet.callPublicFn("legal_chain", "create-legal-contract",
+      [Cl.uint(1), Cl.list([Cl.principal(wallet1), Cl.principal(wallet2)]), 
+       Cl.stringAscii("US-NY"), Cl.stringAscii("test"), Cl.uint(simnet.blockHeight + 200),
+       Cl.stringAscii("terms"), Cl.stringAscii("uri"), Cl.uint(1000), Cl.uint(2)], wallet1);
+    
+    // Sign contract
+    simnet.callPublicFn("legal_chain", "sign-contract", [Cl.uint(1), Cl.stringAscii("s1"), Cl.none()], wallet1);
+    simnet.callPublicFn("legal_chain", "sign-contract", [Cl.uint(1), Cl.stringAscii("s2"), Cl.none()], wallet2);
+
+    // Non-party trying to file dispute
+    const { result: nonPartyDispute } = simnet.callPublicFn(
+      "legal_chain",
+      "file-dispute",
+      [Cl.uint(1), Cl.principal(wallet2), Cl.stringAscii("test"), Cl.stringAscii("evidence")],
+      wallet3 // Not a party to contract
+    );
+    expect(nonPartyDispute).toBeErr(Cl.uint(406)); // ERR_INVALID_PARTY
+
+    // Invalid defendant (not party to contract)
+    const { result: invalidDefendant } = simnet.callPublicFn(
+      "legal_chain",
+      "file-dispute",
+      [Cl.uint(1), Cl.principal(wallet3), Cl.stringAscii("test"), Cl.stringAscii("evidence")],
+      wallet1
+    );
+    expect(invalidDefendant).toBeErr(Cl.uint(406)); // ERR_INVALID_PARTY
+
+    // Non-existent contract
+    const { result: nonExistentContract } = simnet.callPublicFn(
+      "legal_chain",
+      "file-dispute",
+      [Cl.uint(999), Cl.principal(wallet2), Cl.stringAscii("test"), Cl.stringAscii("evidence")],
+      wallet1
+    );
+    expect(nonExistentContract).toBeErr(Cl.uint(402)); // ERR_CONTRACT_NOT_FOUND
+  });
+
+  it("should handle enforcement action workflow", () => {
+    // Set up active contract first
+    simnet.callPublicFn("legal_chain", "create-contract-template",
+      [Cl.stringAscii("Enforcement Test"), Cl.stringAscii("service"), Cl.stringAscii("DE-BW"),
+       Cl.stringAscii("enforcement123"), Cl.stringAscii("premium")], wallet1);
+    
+    simnet.callPublicFn("legal_chain", "create-legal-contract",
+      [Cl.uint(1), Cl.list([Cl.principal(wallet1), Cl.principal(wallet2)]), 
+       Cl.stringAscii("DE-BW"), Cl.stringAscii("service"), Cl.uint(simnet.blockHeight + 300),
+       Cl.stringAscii("enforcementterms"), Cl.stringAscii("uri"), Cl.uint(15000), Cl.uint(2)], wallet1);
+    
+    // Sign to activate
+    simnet.callPublicFn("legal_chain", "sign-contract", [Cl.uint(1), Cl.stringAscii("s1"), Cl.none()], wallet1);
+    simnet.callPublicFn("legal_chain", "sign-contract", [Cl.uint(1), Cl.stringAscii("s2"), Cl.none()], wallet2);
+
+    // Initiate enforcement action
+    const enforcementBlock = simnet.blockHeight;
+    const deadlineBlock = enforcementBlock + 50;
+    const { result: enforcementResult } = simnet.callPublicFn(
+      "legal_chain",
+      "initiate-enforcement",
+      [
+        Cl.uint(1), // contract-id
+        Cl.principal(wallet2), // target-party
+        Cl.stringAscii("payment-demand"),
+        Cl.uint(5000), // amount
+        Cl.uint(deadlineBlock) // deadline
+      ],
+      wallet1
+    );
+    expect(enforcementResult).toBeOk(Cl.uint(1));
+
+    // Verify enforcement action was created
+    const { result: actionData } = simnet.callReadOnlyFn(
+      "legal_chain",
+      "get-enforcement-action",
+      [Cl.uint(1)],
+      deployer
+    );
+    
+    expect(actionData).toBeSome(
+      Cl.tuple({
+        "contract-id": Cl.uint(1),
+        "action-type": Cl.stringAscii("payment-demand"),
+        "initiated-by": Cl.principal(wallet1),
+        "target-party": Cl.principal(wallet2),
+        amount: Cl.uint(5000),
+        deadline: Cl.uint(deadlineBlock),
+        status: Cl.stringAscii("pending"),
+        "completion-proof": Cl.none()
+      })
+    );
+  });
+
+  it("should reject invalid enforcement actions", () => {
+    // Set up contract
+    simnet.callPublicFn("legal_chain", "create-contract-template",
+      [Cl.stringAscii("Invalid Enforcement"), Cl.stringAscii("test"), Cl.stringAscii("US-NY"),
+       Cl.stringAscii("invalidenforcement"), Cl.stringAscii("basic")], wallet1);
+    
+    simnet.callPublicFn("legal_chain", "create-legal-contract",
+      [Cl.uint(1), Cl.list([Cl.principal(wallet1), Cl.principal(wallet2)]), 
+       Cl.stringAscii("US-NY"), Cl.stringAscii("test"), Cl.uint(simnet.blockHeight + 100),
+       Cl.stringAscii("terms"), Cl.stringAscii("uri"), Cl.uint(1000), Cl.uint(2)], wallet1);
+    
+    // Sign contract
+    simnet.callPublicFn("legal_chain", "sign-contract", [Cl.uint(1), Cl.stringAscii("s1"), Cl.none()], wallet1);
+    simnet.callPublicFn("legal_chain", "sign-contract", [Cl.uint(1), Cl.stringAscii("s2"), Cl.none()], wallet2);
+
+    // Non-party trying to initiate enforcement
+    const { result: nonPartyEnforcement } = simnet.callPublicFn(
+      "legal_chain",
+      "initiate-enforcement",
+      [Cl.uint(1), Cl.principal(wallet2), Cl.stringAscii("test"), Cl.uint(1000), Cl.uint(simnet.blockHeight + 10)],
+      wallet3 // Not a party
+    );
+    expect(nonPartyEnforcement).toBeErr(Cl.uint(406)); // ERR_INVALID_PARTY
+
+    // Invalid target party
+    const { result: invalidTarget } = simnet.callPublicFn(
+      "legal_chain",
+      "initiate-enforcement",
+      [Cl.uint(1), Cl.principal(wallet3), Cl.stringAscii("test"), Cl.uint(1000), Cl.uint(simnet.blockHeight + 10)],
+      wallet1
+    );
+    expect(invalidTarget).toBeErr(Cl.uint(406)); // ERR_INVALID_PARTY
+
+    // Non-existent contract
+    const { result: nonExistentContract } = simnet.callPublicFn(
+      "legal_chain",
+      "initiate-enforcement",
+      [Cl.uint(999), Cl.principal(wallet2), Cl.stringAscii("test"), Cl.uint(1000), Cl.uint(simnet.blockHeight + 10)],
+      wallet1
+    );
+    expect(nonExistentContract).toBeErr(Cl.uint(402)); // ERR_CONTRACT_NOT_FOUND
+  });
+
+  it("should handle entity verification workflow", () => {
+    // Register entity first
+    simnet.callPublicFn("legal_chain", "register-legal-entity",
+      [Cl.stringAscii("notary"), Cl.stringAscii("US-NY"), Cl.stringAscii("NOT123456"), 
+       Cl.stringAscii("Legal Notary Services LLC")], wallet2);
+
+    // Verify entity (only contract owner can verify)
+    const { result: verifyResult } = simnet.callPublicFn(
+      "legal_chain",
+      "verify-legal-entity",
+      [Cl.principal(wallet2)],
+      deployer
+    );
+    expect(verifyResult).toBeOk(Cl.bool(true));
+
+    // Check entity is now verified
+    const { result: entityData } = simnet.callReadOnlyFn(
+      "legal_chain",
+      "get-legal-entity",
+      [Cl.principal(wallet2)],
+      deployer
+    );
+    
+    expect(entityData).toBeSome(
+      Cl.tuple({
+        "entity-type": Cl.stringAscii("notary"),
+        jurisdiction: Cl.stringAscii("US-NY"),
+        "registration-number": Cl.stringAscii("NOT123456"),
+        "verified-at": Cl.uint(simnet.blockHeight),
+        "is-verified": Cl.bool(true),
+        "legal-name": Cl.stringAscii("Legal Notary Services LLC")
+      })
+    );
+
+    // Non-owner trying to verify (should fail)
+    const { result: unauthorizedVerify } = simnet.callPublicFn(
+      "legal_chain",
+      "verify-legal-entity",
+      [Cl.principal(wallet2)], // Use registered entity
+      wallet1 // But non-owner trying to verify
+    );
+    expect(unauthorizedVerify).toBeErr(Cl.uint(401)); // ERR_UNAUTHORIZED
+  });
+
+  it("should handle administrative functions", () => {
+    // Test platform fee setting (only owner)
+    const { result: setFeeResult } = simnet.callPublicFn(
+      "legal_chain",
+      "set-platform-fee",
+      [Cl.uint(300)], // 3%
+      deployer
+    );
+    expect(setFeeResult).toBeOk(Cl.bool(true));
+
+    // Non-owner trying to set fee
+    const { result: unauthorizedFee } = simnet.callPublicFn(
+      "legal_chain",
+      "set-platform-fee",
+      [Cl.uint(400)],
+      wallet1
+    );
+    expect(unauthorizedFee).toBeErr(Cl.uint(401)); // ERR_UNAUTHORIZED
+
+    // Invalid fee rate (over 10%)
+    const { result: invalidFee } = simnet.callPublicFn(
+      "legal_chain",
+      "set-platform-fee",
+      [Cl.uint(1500)], // 15% - too high
+      deployer
+    );
+    expect(invalidFee).toBeErr(Cl.uint(401)); // ERR_UNAUTHORIZED
+  });
+});
+
 
